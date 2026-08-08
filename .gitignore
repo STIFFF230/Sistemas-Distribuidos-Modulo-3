@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Local editor and assistant settings
+.vscode/
+.claude/settings.local.json
+.idea/
+
+# Reference project excluded from this repository
+CajeroReferencia/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Java/Kotlin build output
+out/
+bin/
+*.class
+.kotlin/
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
