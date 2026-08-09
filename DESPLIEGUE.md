@@ -143,6 +143,27 @@ y no se sube al repositorio. Los pasos 3 y 4 (más abajo) siguen funcionando
 igual con variables de entorno si prefieres esa opción — el `.env` es solo
 un atajo para no repetir el paso cada vez.
 
+### 1.7 Prender/apagar el servidor desde el Mac (recomendado)
+
+En vez de entrar por SSH cada vez y repetir el paso 1.3 a mano, usa estos dos
+scripts desde el Mac (raíz del proyecto, `Modulo3/`). Leen la IP y el puerto
+directo del `.env`, así que si la IP de la VM cambia solo hay que actualizar
+ese archivo una vez:
+
+```bash
+./scripts/start-server.sh   # entra por SSH, arranca el servidor si no estaba
+                             # corriendo, y muestra el final de server.log
+./scripts/stop-server.sh    # entra por SSH y lo mata limpio
+```
+
+Si es la primera vez que los usas, dales permiso de ejecución:
+```bash
+chmod +x scripts/*.sh
+```
+
+Por defecto se conectan como usuario `stiven`; si el usuario de la VM es otro,
+pásalo como argumento: `./scripts/start-server.sh otro_usuario`.
+
 ---
 
 ## 2. Verificar que el puerto realmente quedó accesible
@@ -250,6 +271,7 @@ swift run
    desactívalo en Ajustes del Sistema → General → AirDrop y Handoff.
 7. Si apagaste y volviste a prender la VM Debian: el servidor **no** queda
    corriendo solo (era un proceso lanzado a mano con `nohup`, no un
-   servicio) — tienes que entrar por SSH y repetir el paso 1.3. Además la
-   IP puede haber cambiado (la asigna el DHCP del hipervisor); revisa con
+   servicio) — vuelve a prenderlo con `./scripts/start-server.sh` (ver paso
+   1.7), o entra por SSH y repite el paso 1.3 a mano. Además la IP puede
+   haber cambiado (la asigna el DHCP del hipervisor); revisa con
    `hostname -I` y actualiza `.env` si es distinta (ver paso 1.6).
