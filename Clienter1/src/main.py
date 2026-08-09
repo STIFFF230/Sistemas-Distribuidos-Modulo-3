@@ -9,12 +9,41 @@ import protocol
 from gui import MainWindow
 from network_client import NetworkClient
 
-# Servidor y puerto no se preguntan por pantalla: se toman de aquí, o de las
-# variables de entorno CHAT_HOST/CHAT_PORT si se necesita apuntar a otra
-# máquina (VM Debian, otra IP, etc.) sin tocar el código — ver CLAUDE-2.md
-# sección 16. El valor por defecto coincide con el servidor de pruebas local.
+
+def _load_env_file(filename=".env"):
+    """Carga variables KEY=VALOR desde un archivo .env, buscando desde el
+    directorio de trabajo actual hacia arriba (encuentra tanto un .env junto
+    a main.py como uno compartido en la raíz del proyecto, Modulo3/.env).
+    No sobreescribe variables que ya estén definidas en el entorno real."""
+    here = os.path.abspath(os.getcwd())
+    for _ in range(6):
+        candidate = os.path.join(here, filename)
+        if os.path.isfile(candidate):
+            with open(candidate, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key:
+                        os.environ.setdefault(key, value)
+            return
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+
+
+_load_env_file()
+
+# Servidor y puerto no se preguntan por pantalla ni se fijan en el código
+# (CLAUDE-2.md sección 16). Se toman de las variables de entorno
+# CHAT_HOST/CHAT_PORT (definidas directamente o cargadas desde .env arriba).
+# Edita el archivo .env cuando cambie la IP de la VM Debian, sin tocar código.
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 1802
+DEFAULT_PORT = 5000
 REGISTER_TIMEOUT_MS = 5000
 
 

@@ -117,6 +117,32 @@ hostname -I
 
 Vas a necesitar esa IP (algo como `192.168.64.5`) en los dos clientes.
 
+### 1.6 Guárdala en `.env` (recomendado)
+
+Ambos clientes leen automáticamente un archivo `.env` en la raíz del
+proyecto (`Modulo3/.env`) si existe — así que en vez de exportar variables
+de entorno o editar el esquema de Xcode cada vez que la VM cambia de IP
+(pasa al reiniciarla, ver sección 5.7), basta con editar un archivo de
+texto.
+
+En el Mac (para el cliente Swift) y en la VM Windows (para el cliente
+Python, después de clonar el repo ahí) copia `.env.example` a `.env` y pon
+la IP actual:
+
+```bash
+cp .env.example .env
+```
+
+```text
+CHAT_HOST=192.168.27.129
+CHAT_PORT=5000
+```
+
+`.env` está en `.gitignore`, así que cada máquina mantiene su propia copia
+y no se sube al repositorio. Los pasos 3 y 4 (más abajo) siguen funcionando
+igual con variables de entorno si prefieres esa opción — el `.env` es solo
+un atajo para no repetir el paso cada vez.
+
 ---
 
 ## 2. Verificar que el puerto realmente quedó accesible
@@ -222,3 +248,8 @@ swift run
    rápida (no en la VM), recuerda que el puerto **5000 lo ocupa AirPlay
    Receiver de macOS** — usa otro puerto (ver `ServerChat/Readme.md`) o
    desactívalo en Ajustes del Sistema → General → AirDrop y Handoff.
+7. Si apagaste y volviste a prender la VM Debian: el servidor **no** queda
+   corriendo solo (era un proceso lanzado a mano con `nohup`, no un
+   servicio) — tienes que entrar por SSH y repetir el paso 1.3. Además la
+   IP puede haber cambiado (la asigna el DHCP del hipervisor); revisa con
+   `hostname -I` y actualiza `.env` si es distinta (ver paso 1.6).
