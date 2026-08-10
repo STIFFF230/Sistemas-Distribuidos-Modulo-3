@@ -35,7 +35,7 @@ public final class LineAccumulator {
      * Puede devolver una lista vacía (línea aún incompleta) o con varias
      * líneas (llegaron varias de un tirón).
      */
-    public List<String> append(byte[] data, int count) {
+    public List<String> append(byte[] data, int count) throws LineTooLongException {
         List<String> lines = new ArrayList<>();
         for (int i = 0; i < count; i++) {
             byte b = data[i];
