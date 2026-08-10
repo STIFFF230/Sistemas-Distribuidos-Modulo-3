@@ -5,7 +5,10 @@ y `Cliente2` (Swift/macOS). Ver también `CLAUDE-2.md` (documento fuente).
 
 ## Transporte
 
-- TCP, socket bloqueante.
+- TCP. El servidor usa sockets NO bloqueantes (Java NIO, `Selector`); los clientes (Python, Swift)
+  usan sockets bloqueantes de su propia biblioteca estándar. El protocolo de aplicación (framing,
+  mensajes JSON) es idéntico en ambos casos: el modelo de I/O es un detalle interno de cada
+  implementación y no afecta el contrato de transporte.
 - Un socket persistente por cliente, reutilizado para todo (registro, grupal, privado, lista de usuarios, desconexión).
 - Codificación UTF-8.
 - Cada mensaje es **un objeto JSON en una sola línea**, terminado en `\n`.

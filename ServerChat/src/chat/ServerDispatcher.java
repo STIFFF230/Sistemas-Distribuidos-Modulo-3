@@ -1,60 +1,79 @@
 package chat;
 
+import chat.protocol.Json;
+import chat.protocol.JsonParseException;
 import chat.protocol.Messages;
 
 import java.nio.charset.StandardCharsets;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
 /**
- * Consumidor único de la cola global de eventos. Valida, asigna 'sequence',
- * mantiene el mapa username -> ClientSession y enruta mensajes grupales y
- * privados. Al ser el único hilo que modifica el mapa de sesiones, evita
- * condiciones de carrera sin necesidad de bloqueos adicionales.
+ * Lógica de negocio del chat: registro, mensajes de grupo y privados,
+ * desconexión. ChatServer invoca onLine()/onDisconnected() siempre desde su
+ * único hilo selector, nunca desde dos hilos a la vez -- por eso 'sessions'
+ * es un HashMap normal (no ConcurrentHashMap) y 'sequence' es un long
+ * cualquiera (no AtomicLong): no existe la condición de carrera que esas
+ * estructuras existen para resolver, porque nunca hay dos hilos escribiendo
+ * aquí al mismo tiempo. Contrastar con ServerStats, que sí necesita un
+ * candado explícito porque a esa sí la tocan dos hilos distintos.
  */
-final class ServerDispatcher implements Runnable {
+final class ServerDispatcher {
     private static final Pattern USERNAME_PATTERN = Pattern.compile("[A-Za-z0-9_-]+");
 
-    private final BlockingQueue<ClientEvent> events;
-    private final ConcurrentMap<String, ClientSession> sessions = new ConcurrentHashMap<>();
-    private final AtomicLong sequence = new AtomicLong(0);
+    private final Map<String, ClientSession> sessions = new HashMap<>();
+    private final ServerStats stats;
+    private long sequence = 0;
 
-    ServerDispatcher(BlockingQueue<ClientEvent> events) {
-        this.events = events;
+    ServerDispatcher(ServerStats stats) {
+        this.stats = stats;
     }
 
-    @Override
-    public void run() {
-        while (true) {
-            ClientEvent event;
-            try {
-                event = events.take();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-            try {
-                dispatch(event);
-            } catch (RuntimeException e) {
-                log("Error procesando evento: " + e.getMessage());
-            }
+    /** Una línea completa (un JSON) ya extraída por LineAccumulator. */
+    void onLine(ClientSession session, String line) {
+        Map<String, Object> message;
+        try {
+            message = Json.parseObject(line);
+        } catch (JsonParseException e) {
+            session.enqueue(Messages.error("JSON inválido: " + e.getMessage()));
+            return;
+        }
+        if (!(message.get("type") instanceof String)) {
+            session.enqueue(Messages.error("Falta el campo 'type'."));
+            return;
+        }
+        handleMessage(session, message);
+    }
+
+    /** La línea superó el tamaño máximo permitido (ver ServerConfig). */
+    void onMalformed(ClientSession session, String errorText) {
+        session.enqueue(Messages.error(errorText));
+    }
+
+    void onDisconnected(ClientSession session) {
+        if (!session.markClosed()) {
+            return; // ya se limpió antes
+        }
+        stats.clientDisconnected();
+        String username = session.username();
+        if (username != null) {
+            sessions.remove(username, session);
+            stats.userUnregistered();
+            broadcastAll(Messages.userLeft(username));
+            broadcastAll(Messages.userList(currentUsernames()));
+            log("Usuario desconectado: " + username);
+        } else {
+            log("Conexión cerrada antes de registrarse: " + session.remoteAddress());
         }
     }
 
-    private void dispatch(ClientEvent event) {
-        switch (event.kind()) {
-            case MESSAGE -> handleMessage(event.session(), event.message());
-            case MALFORMED -> event.session().enqueue(Messages.error(event.errorText()));
-            case DISCONNECTED -> handleDisconnect(event.session());
-        }
+    void onConnected(ClientSession session) {
+        stats.clientConnected();
     }
 
     private void handleMessage(ClientSession session, Map<String, Object> msg) {
@@ -70,10 +89,15 @@ final class ServerDispatcher implements Runnable {
         switch (type) {
             case "GROUP_MESSAGE" -> handleGroupMessage(session, msg);
             case "PRIVATE_MESSAGE" -> handlePrivateMessage(session, msg);
-            case "DISCONNECT" -> handleDisconnect(session);
+            case "DISCONNECT" -> requestDisconnect(session);
             case "REGISTER" -> session.enqueue(Messages.error("Ya está registrado como " + session.username() + "."));
             default -> session.enqueue(Messages.error("Tipo de mensaje desconocido: " + type));
         }
+    }
+
+    private void requestDisconnect(ClientSession session) {
+        session.closeChannel();
+        onDisconnected(session);
     }
 
     private void handleRegister(ClientSession session, Map<String, Object> msg) {
@@ -84,12 +108,13 @@ final class ServerDispatcher implements Runnable {
                             + ServerConfig.MAX_USERNAME_LENGTH + " caracteres (letras, números, guion y guion bajo)."));
             return;
         }
-        ClientSession existing = sessions.putIfAbsent(username, session);
-        if (existing != null) {
+        if (sessions.containsKey(username)) {
             session.enqueue(Messages.registerError("El nombre de usuario ya está en uso"));
             return;
         }
+        sessions.put(username, session);
         session.setUsername(username);
+        stats.userRegistered();
         session.enqueue(Messages.registerOk(username));
         session.enqueue(Messages.userList(currentUsernames()));
         broadcastExcept(session, Messages.userJoined(username));
@@ -103,7 +128,8 @@ final class ServerDispatcher implements Runnable {
             return;
         }
         Map<String, Object> out = Messages.groupMessage(
-                session.username(), text.trim(), now(), sequence.incrementAndGet());
+                session.username(), text.trim(), now(), ++sequence);
+        stats.groupMessageSent();
         broadcastAll(out);
     }
 
@@ -120,26 +146,11 @@ final class ServerDispatcher implements Runnable {
             return;
         }
         Map<String, Object> out = Messages.privateMessage(
-                session.username(), to, text.trim(), now(), sequence.incrementAndGet());
+                session.username(), to, text.trim(), now(), ++sequence);
+        stats.privateMessageSent();
         session.enqueue(out);
         if (recipient != session) {
             recipient.enqueue(out);
-        }
-    }
-
-    private void handleDisconnect(ClientSession session) {
-        if (!session.markClosed()) {
-            return; // Ya se limpió (pudo llegar tanto del reader como del writer).
-        }
-        session.closeAndInterruptWriter();
-        String username = session.username();
-        if (username != null) {
-            sessions.remove(username, session);
-            broadcastAll(Messages.userLeft(username));
-            broadcastAll(Messages.userList(currentUsernames()));
-            log("Usuario desconectado: " + username);
-        } else {
-            log("Conexión cerrada antes de registrarse: " + session.remoteAddress());
         }
     }
 
