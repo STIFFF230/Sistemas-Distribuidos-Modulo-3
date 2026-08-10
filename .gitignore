@@ -26,8 +26,7 @@ __pycache__/
 venv/
 
 # Secrets and local environment
-.env
-.env.*
+
 !.env.example
 *.pem
 *.key
