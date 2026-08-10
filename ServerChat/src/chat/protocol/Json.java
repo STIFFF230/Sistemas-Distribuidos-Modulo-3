@@ -23,7 +23,6 @@ public final class Json {
         return sb.toString();
     }
 
-    @SuppressWarnings("unchecked")
     private static void writeValue(Object value, StringBuilder sb) {
         if (value == null) {
             sb.append("null");
