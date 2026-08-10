@@ -156,6 +156,10 @@ ese archivo una vez:
 ./scripts/stop-server.sh    # entra por SSH y lo mata limpio
 ```
 
+rm -rf out
+javac --release 17 -d out $(find src -name "*.java")
+java -cp out Main
+
 Si es la primera vez que los usas, dales permiso de ejecución:
 ```bash
 chmod +x scripts/*.sh
