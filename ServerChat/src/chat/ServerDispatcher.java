@@ -11,30 +11,39 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Pattern;
 
 /**
  * Lógica de negocio del chat: registro, mensajes de grupo y privados,
- * desconexión. ChatServer invoca onLine()/onDisconnected() siempre desde su
- * único hilo selector, nunca desde dos hilos a la vez -- por eso 'sessions'
- * es un HashMap normal (no ConcurrentHashMap) y 'sequence' es un long
- * cualquiera (no AtomicLong): no existe la condición de carrera que esas
- * estructuras existen para resolver, porque nunca hay dos hilos escribiendo
- * aquí al mismo tiempo. Contrastar con ServerStats, que sí necesita un
- * candado explícito porque a esa sí la tocan dos hilos distintos.
+ * desconexión.
+ *
+ * A diferencia de la primera versión (todo corría en el hilo selector),
+ * ahora onLine() puede invocarse desde CUALQUIER hilo del WorkerPool -- en
+ * paralelo real entre clientes distintos, aunque nunca dos veces a la vez
+ * para el MISMO cliente (eso lo garantiza la compuerta CAS de
+ * ClientSession.scheduled, en ChatServer). Por eso 'sessions' (el mapa de
+ * usuarios conectados) y 'sequence' (el número de orden de los mensajes)
+ * SÍ necesitan protegerse con un candado explícito: dos workers procesando
+ * clientes distintos pueden intentar registrar un usuario, transmitir un
+ * mensaje o asignar 'sequence' al mismo tiempo. sessionsLock es ese
+ * candado -- se toma al principio de cada método que toca 'sessions' o
+ * 'sequence', y se libera siempre en un finally.
  */
 final class ServerDispatcher {
     private static final Pattern USERNAME_PATTERN = Pattern.compile("[A-Za-z0-9_-]+");
 
+    private final ReentrantLock sessionsLock = new ReentrantLock();
     private final Map<String, ClientSession> sessions = new HashMap<>();
-    private final ServerStats stats;
+    private final ChatActivityTracker activityTracker;
     private long sequence = 0;
 
-    ServerDispatcher(ServerStats stats) {
-        this.stats = stats;
+    ServerDispatcher(ChatActivityTracker activityTracker) {
+        this.activityTracker = activityTracker;
     }
 
-    /** Una línea completa (un JSON) ya extraída por LineAccumulator. */
+    /** Una línea completa (un JSON) ya extraída por LineAccumulator. Puede
+     * correr en cualquier hilo del WorkerPool. */
     void onLine(ClientSession session, String line) {
         Map<String, Object> message;
         try {
@@ -55,25 +64,33 @@ final class ServerDispatcher {
         session.enqueue(Messages.error(errorText));
     }
 
+    /** Puede llamarse desde el hilo selector (socket roto/cerrado) o desde
+     * un worker (mensaje DISCONNECT) -- por eso todo lo que toca aquí está
+     * protegido por sessionsLock, sin importar qué hilo la invoque. */
     void onDisconnected(ClientSession session) {
         if (!session.markClosed()) {
-            return; // ya se limpió antes
+            return; // ya se limpió antes (posible desde dos hilos a la vez)
         }
-        stats.clientDisconnected();
         String username = session.username();
-        if (username != null) {
+        if (username == null) {
+            log("Conexión cerrada antes de registrarse: " + session.remoteAddress());
+            return;
+        }
+        sessionsLock.lock();
+        try {
             sessions.remove(username, session);
-            stats.userUnregistered();
+            activityTracker.remove(username);
             broadcastAll(Messages.userLeft(username));
             broadcastAll(Messages.userList(currentUsernames()));
-            log("Usuario desconectado: " + username);
-        } else {
-            log("Conexión cerrada antes de registrarse: " + session.remoteAddress());
+        } finally {
+            sessionsLock.unlock();
         }
+        log("Usuario desconectado: " + username);
     }
 
     void onConnected(ClientSession session) {
-        stats.clientConnected();
+        // Nada que hacer aquí: la sesión se registra en 'sessions' solo
+        // cuando el cliente completa REGISTER (ver handleRegister).
     }
 
     private void handleMessage(ClientSession session, Map<String, Object> msg) {
@@ -108,16 +125,21 @@ final class ServerDispatcher {
                             + ServerConfig.MAX_USERNAME_LENGTH + " caracteres (letras, números, guion y guion bajo)."));
             return;
         }
-        if (sessions.containsKey(username)) {
-            session.enqueue(Messages.registerError("El nombre de usuario ya está en uso"));
-            return;
+        sessionsLock.lock();
+        try {
+            if (sessions.containsKey(username)) {
+                session.enqueue(Messages.registerError("El nombre de usuario ya está en uso"));
+                return;
+            }
+            sessions.put(username, session);
+            session.setUsername(username);
+            activityTracker.recordActivity(username); // arranca su reloj de inactividad
+            session.enqueue(Messages.registerOk(username));
+            session.enqueue(Messages.userList(currentUsernames()));
+            broadcastExcept(session, Messages.userJoined(username));
+        } finally {
+            sessionsLock.unlock();
         }
-        sessions.put(username, session);
-        session.setUsername(username);
-        stats.userRegistered();
-        session.enqueue(Messages.registerOk(username));
-        session.enqueue(Messages.userList(currentUsernames()));
-        broadcastExcept(session, Messages.userJoined(username));
         log("Usuario registrado: " + username + " (" + session.remoteAddress() + ")");
     }
 
@@ -127,10 +149,38 @@ final class ServerDispatcher {
             session.enqueue(Messages.error("El mensaje no puede estar vacío ni superar 8 KB."));
             return;
         }
-        Map<String, Object> out = Messages.groupMessage(
-                session.username(), text.trim(), now(), ++sequence);
-        stats.groupMessageSent();
-        broadcastAll(out);
+        sessionsLock.lock();
+        try {
+            Map<String, Object> out = Messages.groupMessage(
+                    session.username(), text.trim(), now(), ++sequence);
+            broadcastAll(out);
+        } finally {
+            sessionsLock.unlock();
+        }
+        activityTracker.recordActivity(session.username()); // acaba de hablar en el grupo
+    }
+
+    /**
+     * Llamado por ChatServer cuando PresenceMonitor detecta usuarios que
+     * llevan un rato sin hablar en el chat grupal. Construye el mensaje
+     * (con su propio número de secuencia, igual que cualquier otro mensaje
+     * grupal) y lo transmite. Corre en el hilo selector (ChatServer la
+     * invoca al drenar la cola de avisos pendientes), pero igual toma el
+     * candado: es el mismo estado compartido que tocan los workers.
+     */
+    void broadcastInactivityNotice(List<String> idleUsernames) {
+        if (idleUsernames.isEmpty()) return;
+        String names = String.join(", ", idleUsernames);
+        String text = idleUsernames.size() == 1
+                ? "💤 " + names + " lleva un rato sin escribir en el grupo."
+                : "💤 " + names + " llevan un rato sin escribir en el grupo.";
+        sessionsLock.lock();
+        try {
+            Map<String, Object> out = Messages.groupMessage("sistema", text, now(), ++sequence);
+            broadcastAll(out);
+        } finally {
+            sessionsLock.unlock();
+        }
     }
 
     private void handlePrivateMessage(ClientSession session, Map<String, Object> msg) {
@@ -140,20 +190,27 @@ final class ServerDispatcher {
             session.enqueue(Messages.error("El mensaje no puede estar vacío ni superar 8 KB."));
             return;
         }
-        ClientSession recipient = to == null ? null : sessions.get(to);
-        if (recipient == null) {
-            session.enqueue(Messages.error("El usuario '" + to + "' no está conectado."));
-            return;
-        }
-        Map<String, Object> out = Messages.privateMessage(
-                session.username(), to, text.trim(), now(), ++sequence);
-        stats.privateMessageSent();
-        session.enqueue(out);
-        if (recipient != session) {
-            recipient.enqueue(out);
+        sessionsLock.lock();
+        try {
+            ClientSession recipient = to == null ? null : sessions.get(to);
+            if (recipient == null) {
+                session.enqueue(Messages.error("El usuario '" + to + "' no está conectado."));
+                return;
+            }
+            Map<String, Object> out = Messages.privateMessage(
+                    session.username(), to, text.trim(), now(), ++sequence);
+            session.enqueue(out);
+            if (recipient != session) {
+                recipient.enqueue(out);
+            }
+        } finally {
+            sessionsLock.unlock();
         }
     }
 
+    /** Siempre llamado con sessionsLock ya tomado (ReentrantLock permite
+     * la reentrada del mismo hilo, pero por diseño todas las llamadas a
+     * este método ya vienen de dentro de una sección crítica). */
     private void broadcastAll(Map<String, Object> message) {
         for (ClientSession s : sessions.values()) {
             s.enqueue(message);

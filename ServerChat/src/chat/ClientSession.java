@@ -8,30 +8,34 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.Map;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Estado de una conexión sobre un SocketChannel NO bloqueante.
  *
- * En la versión anterior (sockets bloqueantes) cada cliente tenía dos hilos
- * propios (ClientReader/ClientWriter) y por eso el estado compartido entre
- * ellos (outboundQueue, closed) necesitaba estructuras thread-safe
- * (BlockingQueue, AtomicBoolean, campos volatile). Aquí no hay hilos por
- * cliente: el único hilo selector de ChatServer es el que lee, escribe y
- * toca esta instancia, siempre uno a la vez y nunca en paralelo consigo
- * mismo, así que los campos son variables normales sin sincronización.
+ * El SOCKET en sí (channel, key) lo sigue tocando exclusivamente el hilo
+ * selector, igual que siempre. Lo que cambia frente a la versión de un
+ * solo hilo es que el PROCESAMIENTO de los mensajes de este cliente ahora
+ * lo hace un hilo del WorkerPool -- nunca dos a la vez para el mismo
+ * cliente (scheduled es una compuerta de un solo permiso vía CAS), pero sí
+ * en paralelo con los workers que atienden a otros clientes. Por eso
+ * mailbox, scheduled, pendingWrites y closed son estructuras seguras para
+ * varios hilos (Concurrent*, Atomic*).
  */
 final class ClientSession {
     private final SocketChannel channel;
     private final LineAccumulator accumulator;
-    private final Deque<ByteBuffer> pendingWrites = new ArrayDeque<>();
+    private final Queue<ByteBuffer> pendingWrites = new ConcurrentLinkedQueue<>();
+    private final Queue<String> mailbox = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean scheduled = new AtomicBoolean(false);
+    private final AtomicBoolean closed = new AtomicBoolean(false);
     private final String remoteAddress;
 
-    private SelectionKey key;
-    private String username;
-    private boolean closed;
+    private volatile SelectionKey key;
+    private volatile String username;
 
     ClientSession(SocketChannel channel, int maxLineBytes) throws IOException {
         this.channel = channel;
@@ -47,35 +51,61 @@ final class ClientSession {
         return accumulator;
     }
 
-    /** Serializa el mensaje y lo encola para envío; pide al selector que
-     * avise (OP_WRITE) en cuanto el socket pueda aceptar más bytes. */
+    /** Buzón de líneas completas aún no procesadas. Solo el hilo selector
+     * escribe aquí (en read()); los workers lo drenan. */
+    Queue<String> mailbox() {
+        return mailbox;
+    }
+
+    /** Compuerta de un solo permiso: como máximo un worker procesa el
+     * buzón de este cliente a la vez. Garantiza "serial por cliente,
+     * paralelo entre clientes" sin usar un lock para esto en particular. */
+    AtomicBoolean scheduled() {
+        return scheduled;
+    }
+
+    /**
+     * Serializa el mensaje y lo encola para envío. Puede llamarse desde
+     * cualquier hilo del WorkerPool (varios workers pueden encolarle algo
+     * a la misma sesión, p. ej. un broadcast) o desde el propio selector.
+     * Pide al selector que avise (OP_WRITE) en cuanto el socket pueda
+     * aceptar más bytes, y lo despierta con wakeup() por si estaba
+     * bloqueado en select() esperando actividad de otros sockets.
+     */
     void enqueue(Map<String, Object> message) {
-        if (closed) return;
+        if (closed.get()) return;
         byte[] bytes = (Json.write(message) + "\n").getBytes(StandardCharsets.UTF_8);
-        pendingWrites.addLast(ByteBuffer.wrap(bytes));
-        if (key != null && key.isValid()) {
-            key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+        pendingWrites.offer(ByteBuffer.wrap(bytes));
+        SelectionKey k = key;
+        if (k != null && k.isValid()) {
+            k.interestOps(k.interestOps() | SelectionKey.OP_WRITE);
+            k.selector().wakeup();
         }
     }
 
     /**
-     * Llamado por ChatServer cuando el canal señala OP_WRITE. write() en un
-     * canal no bloqueante puede escribir menos bytes de los pedidos (el
-     * búfer de envío del SO está lleno) -- por eso hay que reintentar por
-     * partes en llamadas sucesivas, nunca asumir que se escribió todo de
-     * una vez como se podía asumir con BufferedWriter.write() bloqueante.
+     * Llamado SOLO por el hilo selector cuando el canal señala OP_WRITE.
+     * write() en un canal no bloqueante puede escribir menos bytes de los
+     * pedidos -- por eso hay que reintentar por partes en llamadas
+     * sucesivas. Al final se re-revisa la cola antes de apagar OP_WRITE:
+     * un worker pudo haber encolado un mensaje nuevo justo cuando este
+     * método ya había visto la cola vacía.
      */
     void flushPending() throws IOException {
-        while (!pendingWrites.isEmpty()) {
-            ByteBuffer buf = pendingWrites.peekFirst();
+        ByteBuffer buf;
+        while ((buf = pendingWrites.peek()) != null) {
             channel.write(buf);
             if (buf.hasRemaining()) {
                 return; // el SO todavía no puede aceptar más bytes ahora mismo
             }
-            pendingWrites.pollFirst();
+            pendingWrites.poll();
         }
-        if (key != null && key.isValid()) {
-            key.interestOps(SelectionKey.OP_READ); // nada pendiente: deja de escuchar OP_WRITE
+        SelectionKey k = key;
+        if (k != null && k.isValid()) {
+            k.interestOps(SelectionKey.OP_READ);
+            if (!pendingWrites.isEmpty()) {
+                k.interestOps(k.interestOps() | SelectionKey.OP_WRITE);
+            }
         }
     }
 
@@ -85,7 +115,11 @@ final class ClientSession {
         } catch (IOException ignored) {
             // El canal ya puede estar cerrado o roto.
         }
-        if (key != null) key.cancel();
+        SelectionKey k = key;
+        if (k != null) {
+            k.cancel();
+            k.selector().wakeup();
+        }
     }
 
     String username() {
@@ -100,11 +134,12 @@ final class ClientSession {
         return username != null;
     }
 
-    /** Idempotente: devuelve true solo la primera vez que se invoca. */
+    /** Idempotente y atómico (CAS): devuelve true solo la primera vez que
+     * se invoca, incluso si dos hilos lo llaman al mismo tiempo -- por
+     * ejemplo, el selector detecta un socket roto justo cuando un worker
+     * está procesando un DISCONNECT del mismo cliente. */
     boolean markClosed() {
-        if (closed) return false;
-        closed = true;
-        return true;
+        return closed.compareAndSet(false, true);
     }
 
     String remoteAddress() {
