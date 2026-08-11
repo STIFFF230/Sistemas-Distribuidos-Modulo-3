@@ -27,6 +27,5 @@ venv/
 
 # Secrets and local environment
 
-!.env.example
 *.pem
 *.key
